@@ -278,7 +278,7 @@ OPT_JSON=0
 declare -a POSITIONAL=()
 
 parse_options() {
-  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_VAULT=""; OPT_DRY_RUN=0; OPT_JSON=0
+  OPT_DEST=""; OPT_SNAPSHOT=""; OPT_PATH=""; OPT_TARGET=""; OPT_VAULT=""; OPT_DRY_RUN=0; OPT_JSON=0; OPT_VERIFY=0
   POSITIONAL=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -289,6 +289,7 @@ parse_options() {
       --vault) OPT_VAULT="${2:-}"; shift 2 || shift ;;
       --dry-run) OPT_DRY_RUN=1; shift ;;
       --json) OPT_JSON=1; shift ;;
+      --verify) OPT_VERIFY=1; shift ;;
       *) POSITIONAL+=("$1"); shift ;;
     esac
   done
@@ -831,6 +832,7 @@ destinations_table() {
     select_destination "$name"
     label="$(dest_label)"
     repo="$(sanitize_repository "$(dest '.repository // empty')")"
+    repo="$(mirror_where "$repo")"
     schedule="$(dest '.schedule // empty')"
     [ -n "$schedule" ] || schedule="on request"
 
@@ -880,7 +882,7 @@ cmd_destinations() {
     # Non-strict: a destination whose .env is missing must still be listed,
     # otherwise the widget cannot show the user which one needs fixing.
     substitute_vars "$url" 0
-    display="$(sanitize_repository "$SUBST_RESULT")"
+    display="$(mirror_where "$(sanitize_repository "$SUBST_RESULT")")"
     out="$(jq -c \
       --arg name "$name" \
       --arg label "$(dest_label)" \
@@ -1095,6 +1097,8 @@ cmd_backup() {
   trap 'rm -f -- "${SUMMARY_FILE:-}" "${ERROR_FILE:-}" "${UNREADABLE_FILE:-}"' EXIT
 
   restic_context
+  local has_mirror=0
+  mirror_context && has_mirror=1
 
   # restic takes any number of paths, so `source` accepts a string or a list.
   # A string stays the common case; a list is for the person who wants their
@@ -1149,6 +1153,9 @@ cmd_backup() {
   while IFS= read -r pattern; do
     [ -n "$pattern" ] && backup_args+=(--exclude "$pattern")
   done < <(cfg '.excludes[]? // empty' 2>/dev/null)
+  # A local repository usually sits inside the home folder it backs up.
+  # Backing a repository up into itself grows it by its own size every night.
+  [ "$has_mirror" = "1" ] && backup_args+=(--exclude "$MIRROR_LOCAL")
   [ "$(cfg '.one_file_system // true')" = "true" ] && backup_args+=(--one-file-system)
   [ "$(cfg '.skip_if_unchanged // true')" = "true" ] && backup_args+=(--skip-if-unchanged)
   [ "$OPT_DRY_RUN" = "1" ] && backup_args+=(--dry-run)
@@ -1208,6 +1215,19 @@ cmd_backup() {
     progress_write running prune 1
     run_forget
     prune_old_logs
+  fi
+
+  # The snapshot is only safe once it has left the machine, so a mirror that
+  # fails fails the run: the icon goes red and last_success_at stays at the
+  # last night the copy on Proton Drive was complete. The next run resumes
+  # where this one stopped.
+  if [ "$has_mirror" = "1" ] && [ "$result" != "failed" ] && [ "$OPT_DRY_RUN" != "1" ]; then
+    if ! run_mirror 0; then
+      log_line "Mirror failed: $MIRROR_ERROR"
+      printf 'upload to Proton Drive failed: %s' "$MIRROR_ERROR" > "$ERROR_FILE"
+      result=failed
+      backup_exit=1
+    fi
   fi
 
   [ "$OPT_DRY_RUN" = "1" ] || record_status "$started" "$started_epoch" "$backup_exit" "$result" "$summary"
@@ -1315,6 +1335,385 @@ run_forget() {
     --prune >>"$LOG_FILE" 2>&1 ||
     log_line "forget/prune reported a problem, see the log"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Mirroring a local repository to Proton Drive
+#
+# Proton's official CLI (proton-drive) is a file client: upload, list, trash.
+# It has no server mode restic could talk to, so restic writes to a local
+# repository and this pushes that repository's files to Proton Drive after
+# every run. A restic repository suits that well: every file under data/,
+# index/, snapshots/ and keys/ is named after its own content and never
+# changes, so "mirror" reduces to "upload what is new, remove what prune
+# deleted".
+#
+#   "repository": "/home/you/.local/share/omarchy-time-machine/repos/proton",
+#   "mirror": { "type": "proton-drive", "path": "/my-files/Backups/restic" }
+#
+# What is known to be on the remote is kept in a manifest, one "path<TAB>size"
+# per line, appended to after every batch that uploads cleanly. That makes a
+# run resumable: a first upload of 100 GB that dies at 60 GB picks up at 60 GB
+# the next night, instead of asking Proton about every file again. The
+# manifest is a cache of the remote, never the truth; `mirror --verify`
+# rebuilds it from a full listing.
+#
+# Order matters. Packs and indexes go up before the snapshots that refer to
+# them, so a remote copy cut off halfway is never a snapshot pointing at data
+# that is not there. Deletions come last, after everything new is safe.
+# ---------------------------------------------------------------------------
+
+MIRROR_BATCH=40
+MIRROR_RETRIES=4
+# Above this many removals, and above this share of what is on the remote,
+# the mirror refuses to delete anything. Prune removes a few percent of a
+# repository. Losing most of it means the local side is not the repository it
+# was -- emptied, re-initialised, a wrong path -- and mirroring that faithfully
+# would delete the offsite copy at the one moment it is the only copy left.
+MIRROR_DELETE_FLOOR=100
+MIRROR_DELETE_SHARE=25
+MIRROR_TYPE=""
+MIRROR_PATH=""
+MIRROR_LOCAL=""
+MIRROR_MANIFEST=""
+MIRROR_ERROR=""
+
+# Where a destination's copy actually leaves the machine. For a mirrored one
+# that is the remote, not the local repository it is staged in.
+mirror_where() {
+  local path
+  path="$(dest '.mirror.path // empty')"
+  if [ "$(dest '.mirror.type // empty')" = "proton-drive" ] && [ -n "$path" ]; then
+    printf 'proton-drive:%s' "${path%/}"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+mirror_context() {
+  MIRROR_TYPE="$(dest '.mirror.type // empty')"
+  [ -n "$MIRROR_TYPE" ] || return 1
+  [ "$MIRROR_TYPE" = "proton-drive" ] ||
+    die "destination $DEST_NAME has mirror type '$MIRROR_TYPE'; only proton-drive is supported"
+  MIRROR_PATH="$(dest '.mirror.path // empty')"
+  MIRROR_PATH="${MIRROR_PATH%/}"
+  case "$MIRROR_PATH" in
+    /my-files/?*) ;;
+    *) die "mirror.path of $DEST_NAME must be a folder under /my-files, e.g. /my-files/Backups/restic" ;;
+  esac
+  case "$RESTIC_REPOSITORY" in
+    /*) MIRROR_LOCAL="${RESTIC_REPOSITORY%/}" ;;
+    *) die "destination $DEST_NAME has a mirror, so its repository must be a local path (got $REPO_DISPLAY)" ;;
+  esac
+  MIRROR_MANIFEST="$STATE_DIR/mirror-$DEST_NAME.manifest"
+  REPO_DISPLAY="proton-drive:$MIRROR_PATH"
+  return 0
+}
+
+# proton-drive with retries. The CLI is a fresh process every call, and a
+# laptop waking from sleep at 03:00 often has no DNS for the first minute;
+# backing off is what turns that into a slow run instead of a failed one.
+# Output goes to the log, and the last line is kept as the reason if it fails.
+pd() {
+  local attempt=1 delay="${OMARCHY_TIME_MACHINE_RETRY_DELAY:-15}" out status
+  while :; do
+    out="$(proton-drive "$@" 2>&1)"
+    status=$?
+    [ -n "$out" ] && printf '%s\n' "$out" >> "$LOG_FILE"
+    [ "$status" = "0" ] && { PD_OUT="$out"; return 0; }
+    MIRROR_ERROR="$(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1)"
+    [ -n "$MIRROR_ERROR" ] || MIRROR_ERROR="proton-drive exited $status"
+    case "$MIRROR_ERROR" in
+      # Retrying cannot fix these; it only turns a clear answer into a slow one.
+      *"login first"*|*"Command not found"*|*"Usage:"*|*[Nn]ot\ found*|*"does not exist"*|*[Aa]lready\ exists*)
+        return 1 ;;
+    esac
+    [ "$attempt" -ge "$MIRROR_RETRIES" ] && return 1
+    log_line "proton-drive failed (attempt $attempt/$MIRROR_RETRIES), retrying in ${delay}s: $MIRROR_ERROR"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+PD_OUT=""
+
+# Children of a remote folder as "name<TAB>type<TAB>size" lines, into
+# PD_OUT. A folder that does not exist fails like any other error, with
+# MIRROR_ERROR saying so.
+pd_list() {
+  local remote="$1"
+  pd filesystem list --json -- "$remote" || return 1
+  PD_OUT="$(jq -r '
+      # name is {"ok":true,"value":...}; a name that could not be decrypted
+      # has ok:false and is skipped. A file is only there once its revision is
+      # active -- an interrupted upload leaves a draft, which does not count.
+      .[]
+      | select(.name.ok == true)
+      | select(.type == "folder" or .activeRevision.state == "active")
+      | [ .name.value, .type, "?" ]
+      | @tsv' <<<"$PD_OUT" 2>/dev/null)" || { MIRROR_ERROR="unexpected listing output for $remote"; return 1; }
+  return 0
+}
+
+# What the local repository holds, as sorted "relpath<TAB>size". Locks are
+# left out: they belong to the process that wrote them and mean nothing on a
+# copy nobody runs restic against.
+mirror_local_files() {
+  (cd -- "$MIRROR_LOCAL" &&
+    find . -path ./locks -prune -o -type f -printf '%P\t%s\n') | LC_ALL=C sort
+}
+
+# Rebuilds the manifest from the remote itself. Used for the first run, when
+# there is no manifest, and on request after anything touched the remote by
+# hand. Walks only the folders a restic repository has, so the cost is one
+# listing per data/xx subfolder rather than a crawl of the whole drive.
+mirror_rebuild_manifest() {
+  local tmp sub name type size top level2
+  tmp="$(mktemp -- "$STATE_DIR/.manifest.XXXXXX")" || return 1
+  log_line "Reading what is already on Proton Drive at $MIRROR_PATH..."
+
+  if ! pd_list "$MIRROR_PATH"; then
+    case "$MIRROR_ERROR" in
+      *[Nn]ot\ found*|*"does not exist"*)
+        rm -f -- "$tmp"
+        mirror_create_root || return 1
+        : > "$MIRROR_MANIFEST"
+        return 0 ;;
+    esac
+    rm -f -- "$tmp"; return 1
+  fi
+  top="$PD_OUT"
+  while IFS=$'\t' read -r name type size; do
+    [ -n "$name" ] || continue
+    case "$type" in
+      folder)
+        printf '%s/\t0\n' "$name" >> "$tmp"
+        [ "$name" = "locks" ] && continue
+        pd_list "$MIRROR_PATH/$name" || { rm -f -- "$tmp"; return 1; }
+        level2="$PD_OUT"
+        while IFS=$'\t' read -r sub type size; do
+          [ -n "$sub" ] || continue
+          if [ "$type" = "folder" ]; then
+            printf '%s/%s/\t0\n' "$name" "$sub" >> "$tmp"
+            pd_list "$MIRROR_PATH/$name/$sub" || { rm -f -- "$tmp"; return 1; }
+            jq -Rr --arg p "$name/$sub/" 'select(length > 0) | split("\t") | select(.[1] != "folder") | "\($p)\(.[0])\t\(.[2])"' \
+              <<<"$PD_OUT" >> "$tmp"
+          else
+            printf '%s/%s\t%s\n' "$name" "$sub" "$size" >> "$tmp"
+          fi
+        done <<<"$level2"
+        ;;
+      *) printf '%s\t%s\n' "$name" "$size" >> "$tmp" ;;
+    esac
+  done <<<"$top"
+
+  # Proton reports no reliable plaintext size: claimedSize is often null on
+  # files another client uploaded, and totalStorageSize is the encrypted size.
+  # A restic file is named after the hash of its contents, though, so a
+  # committed file with the right name is the right file. Remote names that
+  # also exist locally take the local size; the rest stay "?" and, having no
+  # local counterpart, are what gets removed.
+  awk -F'\t' -v OFS='\t' 'NR==FNR { size[$1]=$2; next }
+       $2 == "?" && ($1 in size) { $2 = size[$1] } { print }' \
+    <(mirror_local_files) "$tmp" | LC_ALL=C sort -u > "$tmp.sized"
+  rm -f -- "$tmp"
+  mv -f -- "$tmp.sized" "$MIRROR_MANIFEST"
+  log_line "Found $(grep -vc '/	0$' -- "$MIRROR_MANIFEST") files already on Proton Drive."
+  return 0
+}
+
+# The mirror folder itself, and any parents under /my-files, on a first run.
+mirror_create_root() {
+  local parent="/my-files" part rest="${MIRROR_PATH#/my-files/}"
+  log_line "Creating $MIRROR_PATH on Proton Drive..."
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    [ "$part" = "$rest" ] && rest="" || rest="${rest#*/}"
+    if ! pd filesystem create-folder -- "$parent" "$part"; then
+      case "$MIRROR_ERROR" in *[Aa]lready\ exists*) ;; *) return 1 ;; esac
+    fi
+    parent="$parent/$part"
+  done
+  return 0
+}
+
+# Makes sure a remote folder exists, creating its parents as needed. Folders
+# are kept in the manifest with a trailing slash so this asks Proton once per
+# folder, ever, instead of once per run.
+mirror_ensure_folder() {
+  local rel="$1" parent name
+  [ -z "$rel" ] && return 0
+  grep -qxF "$rel/	0" -- "$MIRROR_MANIFEST" && return 0
+  parent="$(dirname -- "$rel")"; [ "$parent" = "." ] && parent=""
+  name="$(basename -- "$rel")"
+  mirror_ensure_folder "$parent" || return 1
+  if ! pd filesystem create-folder -- "$MIRROR_PATH${parent:+/$parent}" "$name"; then
+    # Already there is fine; that is what we wanted.
+    case "$MIRROR_ERROR" in *[Aa]lready\ exists*) ;; *) return 1 ;; esac
+  fi
+  printf '%s/\t0\n' "$rel" >> "$MIRROR_MANIFEST"
+  return 0
+}
+
+# Uploads a list of "relpath<TAB>size" lines, grouped by remote folder and in
+# batches, recording each batch in the manifest as soon as it lands.
+mirror_upload() {
+  local list="$1" dir prev="" line rel
+  local -a batch=() batch_lines=()
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rel="${line%%	*}"
+    dir="$(dirname -- "$rel")"; [ "$dir" = "." ] && dir=""
+    if [ "$dir" != "$prev" ] || [ "${#batch[@]}" -ge "$MIRROR_BATCH" ]; then
+      mirror_upload_batch || return 1
+      prev="$dir"
+    fi
+    batch+=("$MIRROR_LOCAL/$rel")
+    batch_lines+=("$line")
+  done <<<"$list"
+  mirror_upload_batch
+}
+
+# Works on mirror_upload's batch, batch_lines and prev, which bash's dynamic
+# scoping makes visible here. Same arrangement as mirror_delete_batch.
+mirror_upload_batch() {
+  [ "${#batch[@]}" -gt 0 ] || return 0
+  mirror_ensure_folder "$prev" || return 1
+  # replace, not skip: a name that is already there but missing from the
+  # manifest is a half-finished upload from an earlier run, and skipping it
+  # would keep that broken copy forever.
+  pd filesystem upload --file-conflict-strategy replace --skip-thumbnails \
+    -- "${batch[@]}" "$MIRROR_PATH${prev:+/$prev}" || return 1
+  printf '%s\n' "${batch_lines[@]}" >> "$MIRROR_MANIFEST"
+  MIRROR_DONE=$((MIRROR_DONE + ${#batch[@]}))
+  progress_write running upload 1 \
+    "$(jq -nc --argjson d "$MIRROR_DONE" --argjson t "$MIRROR_TOTAL" \
+        '{files_done:$d, total_files:$t, percent:(if $t > 0 then $d / $t else 1 end)}')"
+  batch=(); batch_lines=()
+}
+
+# Removes from Proton Drive what prune removed locally: to the trash first,
+# then out of it, because `delete` only accepts trashed items.
+mirror_delete() {
+  local list="$1" rel
+  local -a paths=() rels=()
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    paths+=("$MIRROR_PATH/$rel"); rels+=("$rel")
+    if [ "${#paths[@]}" -ge "$MIRROR_BATCH" ]; then
+      mirror_delete_batch || return 1
+    fi
+  done <<<"$list"
+  mirror_delete_batch
+}
+
+# Works on mirror_delete's paths and rels, through dynamic scoping.
+mirror_delete_batch() {
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  local -a trashed=()
+  local rel
+  pd filesystem trash -- "${paths[@]}" || return 1
+  # Once trashed, an item is addressed by its name under /trash, not by where
+  # it used to live. Restic names are content hashes, so the name is unique
+  # there too. Left in the trash, pruned packs would keep counting against
+  # the storage quota for 30 days; failing to empty it is still not a reason
+  # to fail the backup, since the remote repository itself is already right.
+  for rel in "${rels[@]}"; do trashed+=("/trash/$(basename -- "$rel")"); done
+  pd filesystem delete -- "${trashed[@]}" ||
+    log_line "Could not empty these from the Proton Drive trash; they stay there until Proton purges it."
+  # Drop them from the manifest.
+  printf '%s\n' "${rels[@]}" |
+    awk -F'\t' 'NR==FNR { gone[$1]=1; next } !($1 in gone)' - "$MIRROR_MANIFEST" > "$MIRROR_MANIFEST.tmp" &&
+    mv -f -- "$MIRROR_MANIFEST.tmp" "$MIRROR_MANIFEST"
+  paths=(); rels=()
+}
+
+MIRROR_DONE=0
+MIRROR_TOTAL=0
+
+# The whole mirror step. Returns non-zero with MIRROR_ERROR set on failure.
+run_mirror() {
+  local verify="${1:-0}" local_files known new gone ordered prefix
+
+  command -v proton-drive >/dev/null 2>&1 ||
+    { MIRROR_ERROR="proton-drive is not installed"; return 1; }
+  [ -f "$MIRROR_LOCAL/config" ] ||
+    { MIRROR_ERROR="no restic repository at $MIRROR_LOCAL"; return 1; }
+
+  # One mirror per destination at a time. A hand-run `mirror` overlapping the
+  # nightly one would interleave appends to the manifest. The lock goes with
+  # the process, so a killed run cannot leave it held.
+  exec {MIRROR_LOCK_FD}>"$MIRROR_MANIFEST.lock"
+  flock -n "$MIRROR_LOCK_FD" ||
+    { MIRROR_ERROR="another mirror to $MIRROR_PATH is already running"; return 1; }
+
+  log_line ""
+  log_line "Mirroring to Proton Drive $MIRROR_PATH..."
+  progress_write running upload 1
+
+  if [ "$verify" = "1" ] || ! [ -f "$MIRROR_MANIFEST" ]; then
+    mirror_rebuild_manifest || return 1
+  fi
+
+  local_files="$(mirror_local_files)"
+  known="$(grep -v '/	0$' -- "$MIRROR_MANIFEST" | LC_ALL=C sort -u)"
+
+  # New: local lines (path and size) the manifest does not have. A size
+  # mismatch counts as new, which re-uploads a truncated remote copy.
+  new="$(LC_ALL=C comm -23 <(printf '%s\n' "$local_files") <(printf '%s\n' "$known") | grep -v '^$')"
+  # Gone: remote paths with no local file of that name at all.
+  gone="$(LC_ALL=C comm -13 \
+            <(printf '%s\n' "$local_files" | cut -f1 | LC_ALL=C sort -u) \
+            <(printf '%s\n' "$known" | cut -f1 | LC_ALL=C sort -u) | grep -v '^$')"
+
+  ordered="$(for prefix in data/ index/ keys/ config snapshots/; do
+               printf '%s\n' "$new" | grep "^$prefix" || true
+             done)"
+  # Anything outside the usual layout still goes up, just last.
+  ordered="$ordered
+$(printf '%s\n' "$new" | grep -Ev '^(data/|index/|keys/|config	|snapshots/)' || true)"
+  ordered="$(printf '%s\n' "$ordered" | grep -v '^$')"
+
+  MIRROR_DONE=0
+  MIRROR_TOTAL="$(printf '%s' "$ordered" | grep -c '' || true)"
+  local n_gone; n_gone="$(printf '%s' "$gone" | grep -c '' || true)"
+  log_line "To upload: $MIRROR_TOTAL files ($(printf '%s\n' "$ordered" | awk -F'\t' '{s+=$2} END {printf "%d", s/1048576}') MiB). To remove: $n_gone."
+
+  local n_known; n_known="$(printf '%s' "$known" | grep -c '' || true)"
+  if [ "$n_gone" -gt "$MIRROR_DELETE_FLOOR" ] &&
+     [ $((n_gone * 100)) -gt $((n_known * MIRROR_DELETE_SHARE)) ] &&
+     [ "${OMARCHY_TIME_MACHINE_ALLOW_MASS_DELETE:-}" != "1" ]; then
+    MIRROR_ERROR="refusing to delete $n_gone of $n_known files on Proton Drive; is $MIRROR_LOCAL the right repository? Set OMARCHY_TIME_MACHINE_ALLOW_MASS_DELETE=1 and run mirror by hand if this is intended"
+    return 1
+  fi
+
+  if [ "$MIRROR_TOTAL" -gt 0 ]; then
+    mirror_upload "$ordered" || return 1
+  fi
+  if [ "$n_gone" -gt 0 ]; then
+    mirror_delete "$gone" || return 1
+  fi
+  LC_ALL=C sort -u -o "$MIRROR_MANIFEST" -- "$MIRROR_MANIFEST"
+  log_line "Proton Drive is up to date."
+  return 0
+}
+
+cmd_mirror() {
+  parse_options "$@"
+  load_config
+  select_destination "$OPT_DEST"
+  config_dir_secure
+  private_dir "$STATE_DIR" logs
+  open_log
+  progress_init mirror
+  restic_context
+  mirror_context || die "destination $DEST_NAME has no mirror configured"
+  if run_mirror "$OPT_VERIFY"; then
+    progress_write done upload 1 '{"percent":1.0,"result":"ok"}'
+    return 0
+  fi
+  progress_write failed upload 1 '{"percent":1.0,"result":"failed"}'
+  die "mirror to Proton Drive failed: $MIRROR_ERROR"
 }
 
 # restic shouts "Fatal:" and this script shouts "Error:". The notification it
@@ -1995,6 +2394,8 @@ omarchy-time-machine $VERSION
   ls --dest <name> --snapshot <id> --path </abs> --json
   restore --dest <name> --snapshot <id> --path </abs> [--target <dir>]
   check --dest <name>                 verify repository integrity
+  mirror --dest <name> [--verify]     push the local repository to Proton Drive;
+                                      --verify rebuilds the record of what is there
   install                             (re)write and enable the systemd units
   config create                       write a starter configuration
   log [--dest <name>]                 path of the most recent log file
@@ -2017,6 +2418,7 @@ main() {
     ls) need restic; cmd_ls "$@" ;;
     restore) need restic; cmd_restore "$@" ;;
     check) need restic; cmd_check "$@" ;;
+    mirror) need restic; cmd_mirror "$@" ;;
     install) cmd_install "$@" ;;
     report-failure) cmd_report_failure "$@" ;;
     log) cmd_log "$@" ;;

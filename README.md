@@ -69,6 +69,40 @@ List more than one and the panel lists them all, each with its own schedule and 
 
 Anywhere restic can write works: a local disk, SFTP, a REST server, S3, Minio, Wasabi, Backblaze B2, Azure Blob, Google Cloud Storage, Alibaba OSS, OpenStack Swift, or anything rclone can reach. A drive in your bag and a bucket in the cloud is a good pair: one is fast, the other survives your house.
 
+### Proton Drive
+
+restic can't write to Proton Drive. rclone can, sort of. Its Proton backend is unofficial, and in practice it fails a lot of nights with half-finished uploads and 500s from Proton's API. Proton's own [command line client](https://proton.me/download/drive/cli/index.html) is the reliable route, but it only uploads and downloads files. restic can't use it as a repository.
+
+So for Proton the plugin works in two steps. restic backs up to a repository on this machine, and when it's done, Time Machine copies whatever changed in that repository up to Proton Drive:
+
+```json
+{ "name": "proton",
+  "repository": "/home/you/.local/share/omarchy-time-machine/repos/proton",
+  "mirror": { "type": "proton-drive", "path": "/my-files/Backups/time-machine" } }
+```
+
+Install `proton-drive`, run `proton-drive auth login` once, and the rest is the same as any other destination. The login lives in your keyring, so the keyring has to be unlocked when the nightly backup starts.
+
+The price is disk space. You keep a whole second copy of your backups on this machine. The local repository is left out of the backup itself, so it doesn't back itself up every night. The upside is that restoring from the panel reads that local copy, which is fast and works on a plane.
+
+Uploads happen in an order that keeps the copy on Proton usable at every point. Data goes up before the snapshots that use it, and old files only get deleted, from the trash as well, once everything new has arrived. If the upload fails, the backup counts as failed and the icon turns red. The next run picks up where that one stopped instead of starting over. And if the local repository suddenly looks like it lost most of its files, the upload refuses to delete them from Proton, because that's exactly the moment the offsite copy matters.
+
+To push by hand, or to recheck what's really on Proton Drive after you've touched it yourself:
+
+```bash
+omarchy-time-machine mirror --dest proton
+omarchy-time-machine mirror --dest proton --verify
+```
+
+If this machine is gone, download the folder and point restic at it:
+
+```bash
+proton-drive fs download /my-files/Backups/time-machine ~/restore
+restic -r ~/restore/time-machine restore latest --target ~/Restored
+```
+
+One catch if you're moving from rclone. Proton's client can't open files that rclone uploaded (their keys use Argon2, which it doesn't support yet). Copy your existing repository down with rclone once, use that as the local repository, and let `mirror` upload it to a new folder.
+
 ## Pick a password
 
 Your backups are encrypted, and that's not optional. An external drive gets lost, a NAS gets stolen, a bucket in the cloud sits on somebody else's computer. Encrypted means that when your backup ends up somewhere you didn't intend, it's noise to whoever finds it.
@@ -128,6 +162,7 @@ You only need `name` and `repository`. Everything else already has a sensible de
 | `display_name` | the `name` | What the panel calls it. "The drive in my bag" reads better than `usb2`. |
 | `pre_command` | none | A command to wake the destination first. See below. |
 | `on_failure_command` | none | A command to run when a backup fails, if a red icon isn't enough. |
+| `mirror` | none | Copy a local repository to Proton Drive after each backup. See [Proton Drive](#proton-drive). |
 
 Run `omarchy-time-machine install` again after changing a schedule.
 

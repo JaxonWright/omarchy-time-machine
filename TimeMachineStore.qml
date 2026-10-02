@@ -244,6 +244,10 @@ Singleton {
       if (phase === "pre") return "Waking up the destination\u2026"
       if (phase === "unlock") return "Unlocking\u2026"
       if (phase === "prune") return "Tidying up old backups\u2026"
+      if (phase === "upload") {
+        if (!p || !p.total_files) return "Uploading to Proton Drive\u2026"
+        return "Uploading to Proton Drive\u2026 " + (p.files_done || 0) + " of " + p.total_files + " files"
+      }
 
       var phrase = workingPhrase(d.name)
       if (!p || !p.total_bytes) return phrase + "\u2026"

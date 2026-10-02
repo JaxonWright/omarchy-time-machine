@@ -641,6 +641,168 @@ check $? "running it again leaves an existing configuration alone"
 
 cp "$CONFIG_BACKUP" "$CONFIG"
 
+# --- proton drive mirror ---------------------------------------------------
+#
+# Against a stand-in for Proton's CLI that keeps "Proton Drive" in a folder.
+# It copies the real CLI's shape where the mirror depends on it: names arrive
+# as {ok, value}, a file only counts once its revision is active, a trashed
+# item can only be deleted as /trash/<name>, and a missing path is "not found".
+
+group_restic "Proton Drive mirror"
+
+FAKE="$WORK/fake-proton"
+mkdir -p "$WORK/fakebin" "$FAKE/drive/my-files" "$FAKE/trash"
+cat > "$WORK/fakebin/proton-drive" <<'FAKECLI'
+#!/usr/bin/env bash
+D="$FAKE_PROTON"; printf '%s\n' "$*" >> "$D/calls"
+args=(); skipnext=""
+for a in "$@"; do
+  if [ -n "$skipnext" ]; then skipnext=""; continue; fi
+  case "$a" in
+    --json|--skip-thumbnails|--) ;;
+    --file-conflict-strategy|--folder-conflict-strategy) skipnext=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+cmd="${args[0]:-} ${args[1]:-}"; set -- "${args[@]:2}"
+case "$cmd" in
+  "filesystem list")
+    [ -d "$D/drive$1" ] || { echo "Node not found: $1"; exit 1; }
+    for n in "$D/drive$1"/*; do
+      [ -e "$n" ] || continue
+      if [ -d "$n" ]; then t=folder; else t=file; fi
+      jq -nc --arg n "${n##*/}" --arg t "$t" \
+        '{name:{ok:true, value:$n}, type:$t,
+          activeRevision:(if $t == "file" then {state:"active", claimedSize:null} else null end)}'
+    done | jq -sc . ;;
+  "filesystem create-folder")
+    [ -d "$D/drive$1" ] || { echo "Node not found: $1"; exit 1; }
+    [ -e "$D/drive$1/$2" ] && { echo "A file or folder with that name already exists"; exit 1; }
+    mkdir "$D/drive$1/$2" ;;
+  "filesystem upload")
+    dst="${!#}"
+    [ -d "$D/drive$dst" ] || { echo "Node not found: $dst"; exit 1; }
+    for f in "${@:1:$#-1}"; do
+      if [ -n "${FAKE_FAIL_AFTER:-}" ]; then
+        n="$(cat "$D/uploads" 2>/dev/null || echo 0)"
+        [ "$n" -ge "$FAKE_FAIL_AFTER" ] && { echo "500 Internal Server Error"; exit 1; }
+        echo $((n + 1)) > "$D/uploads"
+      fi
+      cp -- "$f" "$D/drive$dst/"
+    done ;;
+  "filesystem trash")
+    for p in "$@"; do mv -- "$D/drive$p" "$D/trash/" || exit 1; done ;;
+  "filesystem delete")
+    for p in "$@"; do
+      case "$p" in
+        /trash/*) rm -f -- "$D/trash/${p#/trash/}" ;;
+        *) echo "You can permanently delete items only from trash."; exit 1 ;;
+      esac
+    done ;;
+  *) echo "Command not found: $cmd"; exit 1 ;;
+esac
+FAKECLI
+chmod +x "$WORK/fakebin/proton-drive"
+
+REMOTE="$FAKE/drive/my-files/Backups/tm"
+mirrored() {
+  diff <(cd "$WORK/src/.repo" && find . -path ./locks -prune -o -type f -print | sort) \
+       <(cd "$REMOTE" && find . -type f | sort) >/dev/null 2>&1
+}
+
+cp "$WORK/config.bak" "$CONFIG"
+# The repository sits inside the source on purpose, the way one in ~/.local
+# sits inside a backed-up home folder.
+jq --arg r "$WORK/src/.repo" '
+  .destinations += [{name:"proton", repository:$r, retention:{daily:1, weekly:0, monthly:0, yearly:0},
+                     mirror:{type:"proton-drive", path:"/my-files/Backups/tm"}}]' \
+  "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+mkdir -p "$FAKE/drive/my-files/Backups"
+
+# Not a subshell: check() has to count into this shell's totals.
+SAVED_PATH="$PATH"
+export PATH="$WORK/fakebin:$PATH" FAKE_PROTON="$FAKE" OMARCHY_TIME_MACHINE_RETRY_DELAY=0
+printf 'proton-password\n' | $CLI key set --dest proton >/dev/null 2>&1
+$CLI init --dest proton >/dev/null 2>&1
+
+$CLI backup --dest proton >/dev/null 2>&1
+[ $? = 0 ] && mirrored
+check $? "a backup uploads the whole repository, creating the remote folder"
+
+restic -r "$WORK/src/.repo" --password-file "$XDG_CONFIG_HOME/omarchy-time-machine/proton.key" \
+  ls latest 2>/dev/null | grep -q '/\.repo'
+check $((1 - $?)) "the local repository is left out of its own backup"
+
+[ "$($CLI destinations --json | jq -r '.destinations[] | select(.name == "proton") | .repository_display')" \
+  = "proton-drive:/my-files/Backups/tm" ]
+check $? "destinations names the remote, not the staging repository"
+
+: > "$FAKE/calls"
+$CLI mirror --dest proton >/dev/null 2>&1
+[ $? = 0 ] && ! [ -s "$FAKE/calls" ]
+check $? "a mirror with nothing new makes no calls to Proton Drive"
+
+# An upload that dies partway fails the run, and the next one resumes.
+head -c 300000 /dev/urandom > "$WORK/src/docs/more.bin"
+echo 0 > "$FAKE/uploads"
+FAKE_FAIL_AFTER=1 $CLI backup --dest proton >/dev/null 2>&1
+check $((1 - $?)) "a failed upload fails the backup"
+[ "$(jq -r '.destinations.proton.last_run.result' "$STATUS")" = "failed" ] &&
+  jq -r '.destinations.proton.last_run.error' "$STATUS" | grep -q "upload to Proton Drive failed: 500"
+check $? "and the panel says the upload is what failed"
+
+: > "$FAKE/calls"
+$CLI mirror --dest proton >/dev/null 2>&1
+[ $? = 0 ] && mirrored
+check $? "the next run finishes what the failed one started"
+! grep -q "^filesystem list" "$FAKE/calls"
+check $? "and resumes from the manifest instead of re-listing the remote"
+
+# Snapshots go up after the data they refer to.
+awk '/^filesystem upload/ { if ($0 ~ /\/snapshots\//) s = NR; else if ($0 ~ /\/data\//) d = NR }
+     END { exit !(s > d) }' "$FAKE/calls"
+check $? "snapshots are uploaded after their data"
+
+# Retention keeps one snapshot a day, so this prunes the earlier ones.
+echo "changed" >> "$WORK/src/docs/note.txt"
+$CLI backup --dest proton >/dev/null 2>&1
+[ $? = 0 ] && mirrored && [ -z "$(ls -A "$FAKE/trash")" ]
+check $? "what prune removed is deleted from Proton Drive, trash included"
+
+$CLI mirror --dest proton --verify >/dev/null 2>&1
+[ $? = 0 ] && grep -q "To upload: 0 files .* To remove: 0\." "$(ls -t "$XDG_STATE_HOME/omarchy-time-machine/logs/proton/"*.log | head -1)"
+check $? "--verify rebuilds the manifest from the remote and finds nothing to do"
+
+# A local side that lost most of the repository must not take the offsite
+# copy down with it.
+MANIFEST="$XDG_STATE_HOME/omarchy-time-machine/mirror-proton.manifest"
+cp "$MANIFEST" "$WORK/manifest.bak"
+for i in $(seq 1 150); do printf 'data/zz/%064d\t1\n' "$i"; done >> "$MANIFEST"
+BEFORE="$(cd "$REMOTE" && find . -type f | wc -l)"
+OUT="$($CLI mirror --dest proton 2>&1)"
+[ $? != 0 ] && grep -q "refusing to delete" <<<"$OUT" &&
+  [ "$(cd "$REMOTE" && find . -type f | wc -l)" = "$BEFORE" ]
+check $? "a mirror refuses to delete most of the remote"
+cp "$WORK/manifest.bak" "$MANIFEST"
+
+exec {held}>"$MANIFEST.lock"; flock -n "$held"
+OUT="$($CLI mirror --dest proton 2>&1)"
+[ $? != 0 ] && grep -q "already running" <<<"$OUT"
+check $? "two mirrors of one destination do not run at once"
+exec {held}>&-
+
+jq '(.destinations[] | select(.name == "proton")).repository = "sftp:me@nas:/backup"' \
+  "$CONFIG" > "$CONFIG.n" && mv "$CONFIG.n" "$CONFIG"
+OUT="$($CLI mirror --dest proton 2>&1)"
+[ $? != 0 ] && grep -q "must be a local path" <<<"$OUT"
+check $? "a mirror needs a local repository"
+
+export PATH="$SAVED_PATH"
+unset FAKE_PROTON OMARCHY_TIME_MACHINE_RETRY_DELAY
+
+rm -rf -- "$WORK/src/.repo"
+cp "$WORK/config.bak" "$CONFIG"
+
 # --- demo mode -------------------------------------------------------------
 #
 # Screenshots must never show a real home directory, and a click while posing
